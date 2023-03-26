@@ -20,4 +20,6 @@ void VideoCapturerInterfaceImpl::setUncroppedOutput(std::shared_ptr<rtc::VideoSi
 	_capturer->setUncroppedSink(sink);
 }
 
+
+
 } // namespace tgcalls
