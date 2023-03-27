@@ -683,7 +683,7 @@ void MediaManager::setSendVideo(std::shared_ptr<VideoCaptureInterface> videoCapt
         const auto object = GetVideoCaptureAssumingSameThread(_videoCapture.get());
         _isScreenCapture = object->isScreenCapture();
         _videoCaptureGuard = std::make_shared<bool>(true);
-        const auto guard = std::weak_ptr{ _videoCaptureGuard };
+        const auto guard = std::weak_ptr<bool>{ _videoCaptureGuard };
 		object->setStateUpdated([=](VideoState state) {
 			thread->PostTask([=] {
 				// Checking this special guard instead of weak_ptr(this)
