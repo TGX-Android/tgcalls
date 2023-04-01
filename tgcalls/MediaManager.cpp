@@ -1038,14 +1038,14 @@ void MediaManager::fillCallStats(CallStats &callStats) {
 }
 
 void MediaManager::setAudioInputDevice(std::string id) {
-#if defined(WEBRTC_IOS)
+#if defined(WEBRTC_IOS) || defined(WEBRTC_ANDROID)
 #else
     SetAudioInputDeviceById(_audioDeviceModule.get(), id);
 #endif
 }
 
 void MediaManager::setAudioOutputDevice(std::string id) {
-#if defined(WEBRTC_IOS)
+#if defined(WEBRTC_IOS) || defined(WEBRTC_ANDROID)
 #else
     SetAudioOutputDeviceById(_audioDeviceModule.get(), id);
 #endif
