@@ -1054,9 +1054,10 @@ public:
         _threads->getWorkerThread()->BlockingCall([&]() {
             callConfig.audio_state = _channelManager->media_engine()->voice().GetAudioState();
             _call.reset(webrtc::Call::Create(callConfig));
-
+#ifndef WEBRTC_ANDROID
             SetAudioInputDeviceById(_audioDeviceModule.get(), _devicesConfig.audioInputId);
             SetAudioOutputDeviceById(_audioDeviceModule.get(), _devicesConfig.audioOutputId);
+#endif
         });
 
         _uniqueRandomIdGenerator.reset(new rtc::UniqueRandomIdGenerator());
