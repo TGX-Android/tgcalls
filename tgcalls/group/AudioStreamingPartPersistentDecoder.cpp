@@ -21,9 +21,14 @@ bool WrappedCodecParameters::isEqual(AVCodecParameters const *other) {
     if (_value->format != other->format) {
         return false;
     }
+#if LIBAVFORMAT_VERSION_MAJOR >= 59
+    if (_value->ch_layout.nb_channels != other->ch_layout.nb_channels) {
+#else
     if (_value->channels != other->channels) {
+#endif
         return false;
     }
+
     return true;
 }
 
@@ -42,7 +47,11 @@ public:
             } else {
                 _codecContext->pkt_timebase = timeBase;
 
+#if LIBAVFORMAT_VERSION_MAJOR >= 59
+                _channelCount = _codecContext->ch_layout.nb_channels;
+#else
                 _channelCount = _codecContext->channels;
+#endif
 
                 ret = avcodec_open2(_codecContext, codec, nullptr);
                 if (ret < 0) {
@@ -55,6 +64,7 @@ public:
     
     ~AudioStreamingPartPersistentDecoderState() {
         if (_codecContext) {
+            avcodec_close(_codecContext);
             avcodec_free_context(&_codecContext);
         }
     }
@@ -85,6 +95,10 @@ AudioStreamingPartPersistentDecoder::AudioStreamingPartPersistentDecoder() {
 }
 
 AudioStreamingPartPersistentDecoder::~AudioStreamingPartPersistentDecoder() {
+    if (_state) {
+        delete _state;
+        _state = nullptr;
+    }
 }
 
 void AudioStreamingPartPersistentDecoder::maybeReset(AVCodecParameters const *codecParameters, AVRational timeBase) {
