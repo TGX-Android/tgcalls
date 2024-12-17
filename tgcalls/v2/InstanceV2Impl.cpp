@@ -51,6 +51,8 @@
 #include "SignalingEncryption.h"
 #ifdef WEBRTC_IOS
 #include "platform/darwin/iOS/tgcalls_audio_device_module_ios.h"
+#elif WEBRTC_ANDROID
+#include "sdk/android/native_api/audio_device_module/audio_device_android.h"
 #endif
 #include <random>
 #include <sstream>
@@ -1162,8 +1164,10 @@ public:
             callConfig.audio_state = _channelManager->media_engine()->voice().GetAudioState();
             _call = peerConnectionFactoryDependencies.media_factory->CreateCall(callConfig);
 
+#ifndef WEBRTC_ANDROID
             SetAudioInputDeviceById(_audioDeviceModule.get(), _devicesConfig.audioInputId);
             SetAudioOutputDeviceById(_audioDeviceModule.get(), _devicesConfig.audioOutputId);
+#endif
         });
 
         _uniqueRandomIdGenerator.reset(new rtc::UniqueRandomIdGenerator());
@@ -2169,6 +2173,8 @@ private:
         const auto create = [&](webrtc::AudioDeviceModule::AudioLayer layer) {
 #ifdef WEBRTC_IOS
             return rtc::make_ref_counted<webrtc::tgcalls_ios_adm::AudioDeviceModuleIOS>(false, false, false, 1);
+#elif WEBRTC_ANDROID
+            return webrtc::CreateAndroidAudioDeviceModule(layer);
 #else
             return webrtc::AudioDeviceModule::Create(
                 layer,
