@@ -26,6 +26,8 @@
 #include "modules/audio_device/include/audio_device_factory.h"
 #ifdef WEBRTC_IOS
 #include "platform/darwin/iOS/tgcalls_audio_device_module_ios.h"
+#elif WEBRTC_ANDROID
+#include "sdk/android/native_api/audio_device_module/audio_device_android.h"
 #endif
 
 #include "FieldTrialsConfig.h"
@@ -429,6 +431,8 @@ webrtc::scoped_refptr<webrtc::AudioDeviceModule> MediaManager::createAudioDevice
 	const auto create = [&](webrtc::AudioDeviceModule::AudioLayer layer) {
 #ifdef WEBRTC_IOS
         return rtc::make_ref_counted<webrtc::tgcalls_ios_adm::AudioDeviceModuleIOS>(false, false, false, 1);
+#elif WEBRTC_ANDROID
+        return webrtc::CreateAndroidAudioDeviceModule(layer);
 #else
 		return webrtc::AudioDeviceModule::Create(
 			layer,
@@ -697,7 +701,7 @@ void MediaManager::setSendVideo(std::shared_ptr<VideoCaptureInterface> videoCapt
         const auto object = GetVideoCaptureAssumingSameThread(_videoCapture.get());
         _isScreenCapture = object->isScreenCapture();
         _videoCaptureGuard = std::make_shared<bool>(true);
-        const auto guard = std::weak_ptr{ _videoCaptureGuard };
+        const auto guard = std::weak_ptr<bool>{ _videoCaptureGuard };
 		object->setStateUpdated([=](VideoState state) {
 			thread->PostTask([=] {
 				// Checking this special guard instead of weak_ptr(this)
@@ -1073,14 +1077,14 @@ void MediaManager::fillCallStats(CallStats &callStats) {
 }
 
 void MediaManager::setAudioInputDevice(std::string id) {
-#if defined(WEBRTC_IOS)
+#if defined(WEBRTC_IOS) || defined(WEBRTC_ANDROID)
 #else
     SetAudioInputDeviceById(_audioDeviceModule.get(), id);
 #endif
 }
 
 void MediaManager::setAudioOutputDevice(std::string id) {
-#if defined(WEBRTC_IOS)
+#if defined(WEBRTC_IOS) || defined(WEBRTC_ANDROID)
 #else
     SetAudioOutputDeviceById(_audioDeviceModule.get(), id);
 #endif

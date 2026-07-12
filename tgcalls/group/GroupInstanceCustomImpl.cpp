@@ -58,6 +58,8 @@
 #include "StreamingMediaContext.h"
 #ifdef WEBRTC_IOS
 #include "platform/darwin/iOS/tgcalls_audio_device_module_ios.h"
+#elif WEBRTC_ANDROID
+#include "sdk/android/native_api/audio_device_module/audio_device_android.h"
 #endif
 #include <mutex>
 #include <random>
@@ -4361,6 +4363,8 @@ private:
                 };
             }
             return result;
+#elif WEBRTC_ANDROID
+            return webrtc::CreateAndroidAudioDeviceModule(layer);
 #else
             return webrtc::AudioDeviceModule::Create(
                 layer,
