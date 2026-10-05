@@ -160,6 +160,20 @@ For group-churn: success = all churn cycles complete without crash/hang AND base
 - `--reflector-list addr,addr,...` — comma-separated list, one picked at random
 - `--version VER` — caller tgcalls protocol version (default: `13.0.0`)
 - `--version2 VER` — callee tgcalls protocol version (default: same as `--version`). Enables cross-version interop testing.
+- `--wasm-core PATH` — CLI-only override: run the caller's pump core from a module file instead of the version-derived default (`NONE` forces native). Mainly for variant modules; version `19.0.0` already uses the module embedded in the binary. Exists only because the CLI target defines `TGCALLS_ALLOW_EXTERNAL_WASM_CORE` — the app has no such loader.
+- `--wasm-core2 PATH` — same for the callee (defaults to `--wasm-core`; `NONE` forces native)
+- `--custom-params JSON` — sets the caller's engine `customParameters` as a JSON object (merged
+  with the `wasm_core_path` entry the CLI synthesises from `--wasm-core`). This is how to
+  exercise the three new default-off flags without a server-side rollout: e.g.
+  `network_disable_stun_when_unconfigured`, `network_reflector_resolve_remote_candidate_ip`,
+  `network_reference_use_addtrack`.
+- `--custom-params2 JSON` — same for the callee. Independent of `--custom-params` — unlike
+  `--wasm-core2` there is no fallback to the caller's value — so `--custom-params2` **alone**
+  gives the callee different engine parameters than the caller, enabling a within-call A/B on
+  one flag. See `--log-file` below to capture evidence of what a flag actually did:
+  `SetLogToStderr(false)` is set unconditionally by the engines and no file sink exists without
+  it, and `RTC_LOG` is process-global, so one `--log-file` captures both endpoints' output
+  interleaved.
 - `--participants N` — number of CustomImpl participants in group mode (default: 3)
 - `--reference-participants N` — number of ReferenceImpl (PeerConnection-based) participants in group mode (default: 0). Total = `--participants` + `--reference-participants`.
 - `--duration N` — test duration in seconds (default: 10)
@@ -169,6 +183,7 @@ For group-churn: success = all churn cycles complete without crash/hang AND base
 - `--churn-cycles N` — number of join/leave cycles in group-churn mode (default: 100)
 - `--network-scenario NAME` — network simulation test scenario (e.g., `step-down-up`). Group mode only.
 - `--quiet` — summary output only
+- `--log-file PATH` — write RTC_LOG output to a file — log sinks are process-global, so one flag captures both sides; needed to observe `[core]` marker lines
 
 ### Modes
 - **P2P**: Direct loopback, `enableP2P=true`, no servers configured
@@ -183,6 +198,7 @@ For group-churn: success = all churn cycles complete without crash/hang AND base
 - `submodules/TgVoipWebrtc/tgcalls/tgcalls/` — tgcalls library source
 - `submodules/TgVoipWebrtc/tgcalls/tgcalls/group/` — group call implementations (GroupInstanceCustomImpl, GroupInstanceReferenceImpl, GroupNetworkManager, GroupJoinPayloadInternal)
 - `submodules/TgVoipWebrtc/tgcalls/tgcalls/v2/` — v2 implementation (InstanceV2Impl, InstanceV2ReferenceImpl, InstanceV2CompatImpl, NativeNetworkingImpl, SignalingSctpConnection, SignalingTranslator)
+- `submodules/TgVoipWebrtc/tgcalls/tgcalls/v2wasm/` — pump-boundary call core: `CallCoreABI.h` (C ABI v1, a PeerConnection-projection contract since Phase 2.5; since Phase 2.6 also the raw signaling-packet boundary, N-channel data-channel surface, and audio/ICE config knobs), `ReferenceCallCore` (portable control logic, the parity baseline; since Phase 2.6 owns signaling framing via `SignalingFraming`/`CoreGzip`/`CoreBase64`), `CallCoreHost` (harness — since Phase 2.6 seals/routes core-framed packets rather than parsing signaling JSON itself), `InstanceV2PumpImpl` (**versions `18.0.0` = native core and `19.0.0` = embedded wasm core**, both wire-compatible with stock 11.0.0, for a server-side A/B on the substrate); Phase 2 adds the `reference-core-abi1.wasm` module + WAMR backend; Phase 2.5 adds a second module, `variant-core-abi1.wasm` (`VariantCallCore`, wasm-only), demonstrating behavior changes (SDP munge, adaptive bitrate cap, periodic ICE restart) with no harness/CLI rebuild; Phase 2.6 extends the variant demo with signaling padding, an `exp0` data-channel ping/pong, and APM/config-knob demos; Phase 3 embeds the reference module in the binary, compiles the external-module loader out of the app, and deletes the V1 (wire 10.0.0) framing
 - `submodules/TgVoipWebrtc/BUILD` — contains `tgcalls_core` target (C++ only, macOS-native) and `TgVoipWebrtc` target (iOS, ObjC)
 - `third-party/webrtc/` — WebRTC source and BUILD
 - `third-party/webrtc/webrtc/net/dcsctp/` — dc-sctp (SCTP implementation)
@@ -194,9 +210,180 @@ For group-churn: success = all churn cycles complete without crash/hang AND base
 - **Language**: C++17 for tgcalls code
 - **Formatting**: Standard C++ formatting
 
+## Engine audit findings (July 2026)
+
+> **Re-analysed 2026-08-19 — read this before acting on the audit doc.** An adversarial
+> re-analysis re-verified every claim in `docs/engine-audit-2026-07.md` against the tree and
+> **refuted six of them.** The refutations, and the fixes that followed, are recorded in that
+> doc's own header and in "Fixes landed 2026-08-19" below. Do not act on a refuted section.
+
+[`docs/engine-audit-2026-07.md`](docs/engine-audit-2026-07.md) records two investigations: why
+Cloudflare TURN-only underperformed Telegram reflectors in an `InstanceV2Impl` A/B, and an audit
+of `InstanceV2ReferenceImpl` + its custom PeerConnection networking stack. Read it before
+touching relay/ICE code or drawing a conclusion from a relay-backend A/B. The load-bearing points:
+
+- **`ReflectorPort::CreateConnection` keys signalled connections differently from inbound
+  packets on UDP** (`SetResolvedIP` is gated on `PROTO_TCP` at `ReflectorPort.cpp:541`, while
+  `HandleIncomingPacket:765` applies it unconditionally). Measured: 749 signalled relay
+  connections sent 15,985 STUN pings and received **0** responses; every response lands on a
+  peer-reflexive twin. **This affects production (13.0.0).** Do not read the prflx connections as
+  a reflector advantage — 93% of them duplicate an already-signalled address.
+- **`InstanceV2ReferenceImpl` and 18.0.0/19.0.0 are test-only**, so their defects are
+  *measurement* defects, not user-facing ones. Rank arm-asymmetric ones first.
+- **Two arms are not measurable against each other today** — `packet_overhead_bytes` reads 8 vs
+  28 and the route line's remote `turn:` reads 0 vs 1 for structural reasons unrelated to call
+  quality. (The `"network": []` problem is FIXED — see below.) Never key an A/B metric on
+  `remote_candidate().is_relay()`. A separate `relay_backend` field is not needed: `ReflectorPort`
+  mints its local candidate as `reflector-<id>-<tag>.reflector` and that string already lands in
+  `network[].network.local.address`, so reflector routes are identifiable in data you already have.
+- **The injected port allocator loses no configuration vs the default** —
+  `InitializePortAllocator_n` covers injected allocators too. That hypothesis is dead; don't
+  re-open it. The real delta is *what the allocator points at*. NOTE: the audit's claim that the
+  ICE-server mapping loop "silently drops hostname servers" is **refuted** — `IsComplete()` is
+  `!IPIsAny(ip_) && port_ != 0` and `IPIsAny` returns false for `AF_UNSPEC`, so a hostname with a
+  non-zero port passes. Only TCP servers are dropped there.
+- **REJECTED** (2026-08-19 re-analysis) — ~~A directional 1:1 transceiver design needs
+  `AddTrack` + `SetDirectionWithError(kSendOnly)` and an offerer-only pre-declared recvonly
+  slot; pre-creating a recvonly transceiver on the *answerer* is actively harmful.~~ The
+  2026-08-19 re-analysis rejected this directional recipe outright. Do not implement it — see
+  "Do not implement" below.
+
+### Fixes landed 2026-08-19
+
+Unflagged (always on): the `~ReflectorPort` write-after-free and `Close()` iterator invalidation;
+the incoming-video-sink use-after-free in all three PeerConnection engines; swallowed
+`CreatePeerConnectionOrError` failure and its unguarded dereferences; unread SDP-observer errors
+(which could deadlock renegotiation); the duplicate startup offer (every outgoing call offered
+twice — 15.3% of outbound signalling bytes); the missing baseline network record (~77% of failing
+11.0.0 calls uploaded `"network": []`); and the wasm cores' state semantics, which now match
+11.0.0 (ICE `failed` non-terminal, 20s watchdog, 2s disconnect debounce, throttled ICE restart).
+
+**Three experiment flags, all default-off**, read from the server-supplied `customParameters`:
+
+| flag | reaches | effect |
+|---|---|---|
+| `network_reflector_resolve_remote_candidate_ip` | `NativeNetworkingImpl` → `InstanceV2Impl` → versions 7/8/9/12/13 | signalled relay connections can receive binding responses |
+| `network_disable_stun_when_unconfigured` | 11/14/18/19 | stops sending unparseable STUN to reflectors |
+| `network_reference_use_addtrack` | 11.0.0 | removes an extra offer/answer round trip |
+
+Exercise them with the CLI's `--custom-params '<json>'` (caller) / `--custom-params2` (callee).
+
+**Before enabling `network_reflector_resolve_remote_candidate_ip`** — the connection key collapses
+per *candidate*, not per *peer*, and one peer publishes several: `OngoingCallContext.swift` emits
+the v4 and v6 entries of one reflector with the **same `reflectorId` and port**, and there is one
+relay port per network with a fresh random tag. `SocketAddress::operator<` stops comparing
+`hostname_` once `ip_` is set, so with the flag ON they collapse to one key and the collision guard
+refuses the second — dropping a dual-stack peer's relay paths from two to one. (The related packet
+misattribution is *already* today's behaviour on the peer-reflexive path, flag or not.) Only
+"stop stamping the resolved IP on the inbound address, so both sides key on hostname" actually
+removes the collapse, and it uniquely also fixes the pre-existing one — but it touches the
+always-on path and needs its own window. Also note the flag flips the TCP path's collision policy
+from destructive-replace to refuse, and that under `network_standalone_reflectors` the original bug
+does not exist while the collapse still does.
+
+**Readout for that flag is relay-remote connections receiving binding responses** — *not* "prflx
+count goes to zero", which the audit specified and which is wrong: peer-reflexive pairs are still
+minted whenever the peer pings first.
+
+**Call version 12.0.0 — release coordination.** The hardcoded 12.0.0 TCP reflector injection was
+removed app-side. Those entries carried `id: 123456` and were appended *before* `reflectorIdList`
+is built and sorted, so they shifted every real reflector's mapped id — and that id goes on the
+wire as `reflector-<serverId>-<tag>.reflector`, which the peer prefix-matches. **A 12.0.0 call
+between an updated and a not-yet-updated client gets zero signalled relay connections.** Do not
+serve 12.0.0 until the build is fully rolled out.
+
+### Do not implement
+
+Each was proposed by the audit and is wrong: the `WebRTC-UseTurnServerAsStunServer/Disabled/`
+one-liner (`BasicPortAllocator` bypasses the trial when the STUN set is empty — exactly the
+reflector case); resolving the **local** relay candidate's IP (the peer-addressing tag travels only
+inside the synthetic hostname, so this kills relay entirely); the sendonly/recvonly directional
+transceiver recipe; `AddTrack` in `InstanceV2CompatImpl` (its `SignalingTranslator` synthesises
+every callee-side remote offer section as `kSendOnly`, so the edit is inert); a Swift `return []`
+credential filter; and re-anchoring `stop()`'s `baseTimestamp` (production 13.0.0 shares the
+construct and emits no version key to key the discontinuity on).
+
+
+## mtproto transport on the PeerConnection engines (11.0.0, 18/19)
+
+`network_use_mtproto` works on `InstanceV2ReferenceImpl` (11.0.0) and
+`CallCoreHost` (18/19), producing the same wire bytes as 13.0.0. Default off.
+
+**Shape.** Two changes, both gated on the flag:
+
+1. `PeerConnectionFactoryInterface::Options::disable_encryption = true`, set on
+   the factory *before* `CreatePeerConnectionOrError` (that is where
+   `DtlsEnabled()` is read). This makes `JsepTransportController` build a plain
+   `RtpTransport` instead of a `DtlsSrtpTransport`, and stops DTLS entirely.
+2. `PeerConnectionDependencies::ice_transport_factory =
+   MtProtoIceTransportFactory`, which wraps a real `P2PTransportChannel` in
+   `MtProtoIceTransport` and applies `EncryptedConnection` above ICE.
+
+Result: `MtProtoIceTransport -> DtlsTransport (inactive passthrough) ->
+RtpTransport (no SRTP)`. Media is `mtproto(RTP)` and the data channel is
+`mtproto(SCTP)`, with **no DTLS handshake at all** - the same code in the same
+position as 13.0.0's `MtProtoPacketTransport`. Verified on p2p calls: DTLS
+handshake log lines go 45 -> 0, and `Creating UnencryptedRtpTransport` replaces
+`Creating DtlsSrtpTransport`.
+
+This requires the "Allow SCTP without DTLS" patch in the vendored webrtc fork -
+see `submodules/TgVoipWebrtc/CLAUDE.md`. Without it `disable_encryption` also
+kills the data channel and no call can connect.
+
+**Non-obvious invariants**, each of which cost a failed run:
+
+- **`disable_encryption` is not cosmetic, and it is not optional.** It selects
+  the transport class. Without it you get a `DtlsSrtpTransport`, and there is no
+  pass-through mode: `SrtpTransport` refuses to send (`srtp_transport.cc:43-47`)
+  and drops on receive (`:124-128`) when SRTP is inactive. So the only two
+  outcomes are double encryption or a dead call. Nothing ends up unencrypted -
+  mtproto replaces DTLS-SRTP, and the shared key makes DTLS redundant.
+- **Both ends must have the flag.** `disable_encryption` removes the SDP
+  fingerprint, and the mtproto framing is itself asymmetric, so a one-sided flag
+  fails to connect. Safe in production because `phoneCall.custom_parameters` is
+  delivered identically to both participants.
+- **`flags` cannot carry the SCTP/RTP distinction.** 13.0.0 selects its
+  `0xdcdcdcdc` prefix from `flags`, but the inactive `DtlsTransport` drops that
+  argument on send (`dtls_transport.cc:433`) and `RTC_DCHECK(flags == 0)` on
+  receive (`:599`). `MtProtoIceTransport` therefore infers the type with
+  `InferRtpPacketType` and **always re-emits with `flags == 0`**; a non-zero
+  value aborts a `-c dbg` build. The prefix buys wire parity only, not demux -
+  upstream demux is mutual filtering (`RtpTransport` drops non-RTP,
+  `rtp_transport.cc:266-270`; SCTP validates its own).
+- **The 11 signal/callback bridges in `installBridges()` are not
+  compiler-enforced.** Omit one and it fails silently at runtime - miss
+  `SignalCandidateGathered` and candidates never trickle, so the call simply
+  never connects. All of them live in that one method deliberately. The four
+  callback setters are non-virtual, so each is bridged by a lambda on the inner
+  transport reading our own inherited protected member. Every bridge re-emits
+  with `this`, because the controller keys transports by pointer.
+  `MtProtoIceTransportTest.cpp` covers all 11; it is the reason this approach is
+  safe, so do not weaken it.
+- **Do NOT override `SetIceCredentials` / `SetRemoteIceCredentials`.** They are
+  virtual but not pure, and their base implementations already delegate to
+  `SetIceParameters` / `SetRemoteIceParameters`, which the decorator forwards.
+
+**A route that looks right and is not:** subclassing `DtlsSrtpTransport` to skip
+SRTP while leaving DTLS enabled. It works and keeps SCTP, but it defeats the
+purpose - mtproto already carries a shared key, so the DTLS handshake and record
+framing are exactly the overhead worth removing, and it leaves the data channel
+as `mtproto(DTLS(SCTP))` rather than `mtproto(SCTP)`. If you try it anyway, two
+traps: `IsSrtpActive()` must not be forced to `true` (`GetSrtpOverhead` and
+`GetRtpAuthParams` are non-virtual and `RTC_CHECK(send_session_)`, which fires
+in release too), and `SrtpTransport` stores `field_trials` **by reference**
+(`srtp_transport.h:169`), so a temporary `FieldTrialBasedConfig` dangles and
+segfaults mid-handshake.
+
+**Also dead, for the record:** subclassing `P2PTransportChannel` (its
+`OnReadPacket` is private and non-virtual, so inbound cannot be intercepted);
+socket- or PortAllocator-level mtproto (would encrypt STUN, which reflectors
+must parse); and injecting a fake DTLS transport via `dtls_transport_factory`
+(hits the same SCTP gate, so the injection choice was never the blocker).
+
 ## Further Context
 
 When working in these areas, additional `CLAUDE.md` files load automatically:
 - `submodules/TgVoipWebrtc/tgcalls/tools/cli/CLAUDE.md` — CLI test tool architecture (P2P/Reflector, Group), supported version matrix
 - `submodules/TgVoipWebrtc/tgcalls/tools/go_sfu/CLAUDE.md` — Go SFU internals: build integration, bandwidth adaptation, transport-cc feedback, network simulation
+- `submodules/TgVoipWebrtc/tgcalls/tgcalls/v2wasm/CLAUDE.md` — pump-boundary call core (native + WASM): the ABI, backends, `--wasm-core` usage, invariants
 - `submodules/TgVoipWebrtc/CLAUDE.md` — tgcalls library internals: macOS/Linux build patches, SCTP signaling, InstanceV2CompatImpl, GroupInstanceCustomImpl/ReferenceImpl, video pitfalls, known issues
